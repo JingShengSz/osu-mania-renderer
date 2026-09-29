@@ -25,6 +25,12 @@
     "default": "",
     "options": ["", "webgl", "python"]
   },
+  "video_bitrate_kbps": {
+    "description": "视频码率（kbps）",
+    "hint": "决定成片体积，也就决定了上传通道能不能吃得下。默认 2000（≈2 Mbps）：86 秒的谱面约 24MB，4 分钟的谱面约 60MB，都在 video_file_threshold_mb 以内。实测 6000 时同样 86 秒的谱面是 74.8MB，视频通道发送超时（视频其实已经发出去了），4 分钟会到 200MB 根本发不出去。填 0 表示交给渲染服务的默认值（服务端可用 MANIA_BITRATE 环境变量改）。调大可提升画质，但先确认频道传得动。",
+    "type": "int",
+    "default": 2000
+  },
   "video_delivery": {
     "description": "视频投递方式",
     "hint": "file：把视频文件路径交给协议端（要求协议端和本插件在同一台机器）。url：发链接让协议端自己下载（协议端在别的机器时用这个）。",

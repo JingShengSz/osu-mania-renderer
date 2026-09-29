@@ -1648,6 +1648,36 @@ drawVolCircle();
 // chart is roughly 200 MB of encoded data and holding all of it would be its own bug.
 const WC_FPS = 60;
 
+// The two bitrate constants the export picks between. The file has to survive a delivery
+// channel, and which channel decides the ceiling:
+//
+//   * A BOT render is uploaded — the service muxes it, the plugin downloads it and hands
+//     it to the protocol adapter, and the adapter pushes it over a WebSocket upload that
+//     times out on a large body. Measured on a real user render: 6 Mbps produced 74.8 MB
+//     for an 86 s chart, the send call timed out, and the plugin reported a failure even
+//     though the video had already arrived in the chat. The rate for this path is NOT
+//     chosen here — the service sets `window.__webglBitrate` from the request's
+//     `bitrate_kbps` (see mania_render/webapp.py), so the number lives in one place.
+//   * A MANUAL export (a human clicking 导出) is written straight to the local downloads
+//     folder and never crosses an upload channel, so it keeps the higher rate. Nothing
+//     sets `__webglBitrate` on that path, which is what MANUAL_BITRATE is the fallback for.
+const MANUAL_BITRATE = 6_000_000;
+
+// Size backstop for the bot path, independent of the requested rate: the plugin switches
+// from the video channel to the file channel at `video_file_threshold_mb` (80 MB), so an
+// unusually long chart must not sail past it on a high requested rate. 72 MB is the ceiling
+// for the WHOLE file, so it bounds the total rather than just the video; the budget below
+// subtracts the audio the mux is about to add, because a cap that ignores the 192 kbps AAC
+// track is off by ~8% and that is exactly the margin that matters at 4+ minutes.
+//
+// Measured effect: the cap does not bind at all for a 4:11 chart at the 2000 kbps default
+// (2.21 Mbps allowed there vs 2.0 requested), and only starts pulling the rate down past
+// ~5 minutes — where it holds the delivered file near 75 MB instead of growing without
+// limit. A manual export is exempt: it is never uploaded, so capping it would only take
+// quality away for nothing.
+const BOT_MAX_BYTES = 72 * 1024 * 1024;
+const MUX_AUDIO_BPS = 192_000;
+
 /**
  * Encode the beatmap audio to AAC for the in-page muxer.
  *
@@ -1750,12 +1780,15 @@ async function exportWebCodecs(jobId, total, onProgress, isCancelled) {
   // second full encode and throws away quality.
   const outW = Math.max(2, window.__webglOutW || canvas.width);
   const outH = Math.max(2, window.__webglOutH || canvas.height);
-  // A fixed bitrate makes long charts produce unshippable files — 336 s at 12 Mbps is
-  // ~470 MB. Cap it so the result lands near 90 MB (inside QQ's inline-video limit)
-  // unless the requested rate is already lower.
+  // The rate is chosen by whoever asked for the render: the service sets
+  // `window.__webglBitrate` (bits per second) from the request's `bitrate_kbps`. A human
+  // clicking 导出 sets nothing and keeps MANUAL_BITRATE. `bySize` is the delivery backstop
+  // — see both constants above.
   const durationS = Math.max(1, total / WC_FPS);
-  const bySize = Math.floor(90 * 1024 * 1024 * 8 / durationS);
-  const bitrate = Math.max(150_000, Math.min(window.__webglBitrate || 6_000_000, bySize));
+  const bySize = local ? Infinity
+    : Math.floor(BOT_MAX_BYTES * 8 / durationS) - MUX_AUDIO_BPS;
+  const bitrate = Math.max(150_000,
+    Math.min(window.__webglBitrate || MANUAL_BITRATE, bySize));
   const composite = document.createElement('canvas');
   composite.width = outW;
   composite.height = outH;
@@ -1767,6 +1800,13 @@ async function exportWebCodecs(jobId, total, onProgress, isCancelled) {
   let batch = [];
   let batchFrames = 0;
   let posted = Promise.resolve();
+  // Bytes the service has confirmed it holds. Every POST states the offset it is writing
+  // at, which is what lets a failed upload be retried: the service can tell a fresh batch
+  // from a repeat of one whose reply was lost, and re-sending blindly would append the
+  // same bytes twice and corrupt the stream. Measured: one upload in ~250 was lost
+  // mid-flight (the render died at 49% with `Failed to fetch`), so this is not theoretical
+  // -- without it a multi-minute chart is very likely to fail somewhere along the way.
+  let sentBytes = 0;
 
   if (local) {
     const { Track } = await import('./mp4.js');
@@ -1779,13 +1819,33 @@ async function exportWebCodecs(jobId, total, onProgress, isCancelled) {
     localTrack.height = outH;
   }
 
+  // Four tries, backing off 0.2/0.4/0.6 s. The service answers with the offset it holds,
+  // and that answer -- not our own arithmetic -- is what we send next, so the two can
+  // never drift apart.
+  const postBatch = async (blob) => {
+    let lastErr = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        const r = await fetch(`${url}?offset=${sentBytes}`, { method: 'POST', body: blob });
+        if (!r.ok) throw new Error(`上传失败 HTTP ${r.status}`);
+        const j = await r.json();
+        if (typeof j.offset === 'number') sentBytes = j.offset;
+        return;
+      } catch (e) {
+        lastErr = e;
+        if (attempt < 3) await new Promise((res) => setTimeout(res, 200 * (attempt + 1)));
+      }
+    }
+    throw lastErr;
+  };
+
   const flushBatch = () => {
     if (!batch.length) return;
     const blob = new Blob(batch, { type: 'application/octet-stream' });
     batch = [];
     batchFrames = 0;
     posted = posted
-      .then(() => fetch(url, { method: 'POST', body: blob }))
+      .then(() => postBatch(blob))
       .catch((e) => { error = error || e; });
   };
 
@@ -1806,7 +1866,23 @@ async function exportWebCodecs(jobId, total, onProgress, isCancelled) {
     },
     error: (e) => { error = error || e; },
   });
-  encoder.configure({
+  // ── rate control ──────────────────────────────────────────────────────────
+  // `bitrate` alone is NOT a reliable size control: WebCodecs' default is
+  // `bitrateMode: 'variable'`, which lets the encoder trade the target away for quality on
+  // busy content. Measured on this machine, same chart, same requested 2000 kbps:
+  //
+  //   R Skin -> 2,221,891 bps (111% of the request)  -> 24.4 MB for an 86 s chart
+  //   boj    -> 4,778,831 bps (239% of the request)  -> 50.2 MB for the same chart
+  //
+  // and the boj figure reproduced to the bit across three runs, so it is content-driven,
+  // not noise. Extrapolated, a 4-minute boj chart is ~146 MB — past the delivery ceiling
+  // this path exists to stay under. `bitrateMode: 'constant'` asks for CBR, which enforces
+  // the target instead of treating it as a suggestion.
+  //
+  // Only the BOT path needs it; that is the one with a hard upload ceiling. The manual path
+  // keeps the browser's default so a human's local export is unchanged, and the support
+  // check means a browser without CBR quietly keeps VBR rather than failing the export.
+  let encCfg = {
     codec: 'avc1.640028',
     width: outW,
     height: outH,
@@ -1814,7 +1890,16 @@ async function exportWebCodecs(jobId, total, onProgress, isCancelled) {
     framerate: WC_FPS,
     // ffmpeg reads a raw Annex-B elementary stream; the in-page muxer needs AVCC.
     ...(local ? {} : { avc: { format: 'annexb' } }),
-  });
+  };
+  if (!local) {
+    try {
+      const cbr = await VideoEncoder.isConfigSupported({ ...encCfg, bitrateMode: 'constant' });
+      if (cbr && cbr.supported) encCfg = cbr.config;
+    } catch (e) {
+      // No CBR on this build: keep the variable-rate config rather than losing the export.
+    }
+  }
+  encoder.configure(encCfg);
 
   for (let f = 0; f < total; f++) {
     if (isCancelled() || error) break;
@@ -1868,7 +1953,13 @@ async function exportWebCodecs(jobId, total, onProgress, isCancelled) {
 
   flushBatch();
   await posted;
-  await fetch(`${url}?done=1`, { method: 'POST' });
+  // The offset goes with the closing request too, so a batch that never arrived fails the
+  // export HERE with a clear message instead of silently muxing a stream with a hole in it.
+  const fin = await fetch(`${url}?done=1&offset=${sentBytes}`, { method: 'POST' });
+  if (!fin.ok) {
+    const detail = await fin.json().catch(() => ({}));
+    throw new Error(`结束上传失败 HTTP ${fin.status} ${detail.error || ''}`.trim());
+  }
   onProgress(100);
 }
 

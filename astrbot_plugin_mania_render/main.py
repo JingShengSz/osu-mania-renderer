@@ -46,6 +46,12 @@ SCORE_URL_RE = re.compile(
     re.I,
 )
 
+# The same links, but matched whole — scheme and all — so a message can be reduced to "just
+# the user's own words" before its options are parsed. `SCORE_URL_RE` deliberately starts at
+# `osu.ppy.sh`, so substituting IT leaves `https://` behind, and that leftover would then be
+# read as a bare skin name. Matching from the optional scheme removes the token entirely.
+SCORE_LINK_STRIP_RE = re.compile(r"(?:https?://)?osu\.ppy\.sh/\S*", re.I)
+
 # osu! API v2 — the ONLY way to fetch a replay from a server. The website path
 # (osu.ppy.sh/scores/<id>/download) answers 401 with an HTML login page because it wants a
 # browser session cookie, not an API token; /api/v2/... takes a Bearer token instead.
@@ -55,6 +61,16 @@ OSU_REPLAY_URL = "https://osu.ppy.sh/api/v2/scores/{sid}/download"
 MANIA_RULESET_ID = 3
 DEFAULT_SCROLL = 30.0
 DEFAULT_BG_DIM = 0.60
+
+# Video bitrate in kbps, sent to the service as `bitrate_kbps`. This is the one knob that
+# decides the delivered file's size, and the size is what decides whether the upload
+# channel carries it at all. Measured on this pipeline, an 86 s chart:
+#   6000 kbps -> 74.8 MB. The video channel timed out mid-send, the fallback file channel
+#                timed out too, and the chat got a 「发送失败」 for a video the user had
+#                already received. Extrapolated to a 4-minute chart: ~200 MB, undeliverable.
+#   2000 kbps -> ~24 MB, and a 4-minute chart stays near 60 MB, inside the 80 MB
+#                `video_file_threshold_mb` at which the plugin switches to the file channel.
+DEFAULT_BITRATE_KBPS = 2000
 
 RESOLUTIONS = {
     "720": (1280, 720),
@@ -106,6 +122,40 @@ _TRANSPORT_MARKERS = (
 # How many consecutive failed job polls before the node counts as down rather than flaky.
 # At the default 5 s poll interval that is ~30 s of continuous unreachability.
 POLL_UNREACHABLE_LIMIT = 6
+
+# ── "the send call timed out" — NOT the same thing as the node being offline ──────
+# Rendering succeeded and the MP4 exists; what failed is handing it to the platform
+# adapter. That failure is inherently AMBIGUOUS: the adapter's API call times out on the
+# client side while the upload may already have completed server-side. Measured on this
+# bot: a 74.8 MB / 86 s render made `event.send` raise `WebSocket API call timeout` on the
+# video channel and then again on the file channel, and the user had ALREADY received the
+# video. A flat 「发送失败」 is wrong twice over there — it contradicts what the user can
+# see with their own eyes, and it suggests a retry that is not needed and would post the
+# same video a second time.
+_SEND_TIMEOUT_MARKERS = (
+    "timeout", "timed out", "time out", "超时",
+)
+
+
+def _is_send_timeout(exc: BaseException) -> bool:
+    """True when the send failed by TIMING OUT — i.e. delivery is UNKNOWN, not failed."""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    server_timeout = getattr(aiohttp, "ServerTimeoutError", None)
+    if isinstance(server_timeout, type) and isinstance(exc, server_timeout):
+        return True
+    text = str(exc).lower()
+    return any(m in text for m in _SEND_TIMEOUT_MARKERS)
+
+
+def _send_timeout_text(headline: str, exc: BaseException, channel: str) -> str:
+    """The chat text for an ambiguous send: state what is known, and what to do about it."""
+    return (
+        f"{headline}\n"
+        f"发送调用超时（{channel}通道）：{exc}\n"
+        "超时只说明协议端没有在时限内回话，不代表视频没发出去——它很可能已经发到群里了。\n"
+        "请先往上翻确认收到没有；确实没有收到，再重发一次就行。"
+    )
 
 
 def _is_unreachable(exc: BaseException) -> bool:
@@ -186,6 +236,18 @@ class ManiaRenderPlugin(Star):
         key = str(self._cfg("default_resolution", DEFAULT_RESOLUTION)).lower()
         return RESOLUTIONS.get(key, (DEFAULT_WIDTH, DEFAULT_HEIGHT))
 
+    @property
+    def bitrate_kbps(self) -> int:
+        """Video bitrate in kbps. 0 means "whatever the service defaults to".
+
+        A size control as much as a quality one — see DEFAULT_BITRATE_KBPS. Sent to the
+        service as `bitrate_kbps`, exactly like `width`/`height` are sent.
+        """
+        try:
+            return max(0, int(self._cfg("video_bitrate_kbps", DEFAULT_BITRATE_KBPS)))
+        except (TypeError, ValueError):
+            return DEFAULT_BITRATE_KBPS
+
     # ─────────────────────────── HTTP helpers ───────────────────────────
 
     async def _api(self, session: aiohttp.ClientSession, method: str, path: str, **kw):
@@ -214,7 +276,19 @@ class ManiaRenderPlugin(Star):
             logger.warning(f"[mania] 无法获取皮肤列表: {exc}")
             return [], self._default_skin()
         skins = [s["key"] for s in data.get("skins", [])]
-        default = data.get("default") or (skins[0] if skins else self._default_skin())
+        # Precedence, most explicit first:
+        #   1. `default_skin` — a setting the USER wrote in the plugin config. It must win:
+        #      the whole point of setting it is to override what the service suggests.
+        #   2. the service's own `default` — what to use when the user expressed no opinion.
+        #   3. the first skin the service listed.
+        #   4. FALLBACK_SKIN.
+        # The order used to be (2) then (1), which made `default_skin` dead code: the
+        # service always reports a default, so a user who configured "R Skin" silently got
+        # the service's "boj 1-10K" instead. `_default_skin()` cannot be used for step 1
+        # because it substitutes FALLBACK_SKIN when unset, which would win over the
+        # service's default and break the documented "leave it empty" behaviour.
+        configured = str(self._cfg("default_skin", "") or "").strip()
+        default = configured or data.get("default") or (skins[0] if skins else self._default_skin())
         return skins, default
 
     @staticmethod
@@ -500,6 +574,10 @@ class ManiaRenderPlugin(Star):
                 form.add_field("fps", str(opts.get("fps", DEFAULT_FPS)))
                 form.add_field("width", str(width))
                 form.add_field("height", str(height))
+                # Only when non-zero: 0 means "use the service's own default", and sending
+                # an explicit 0 would have to be special-cased on the other side.
+                if self.bitrate_kbps:
+                    form.add_field("bitrate_kbps", str(self.bitrate_kbps))
                 form.add_field("bg_dim", str(opts.get("bg_dim", DEFAULT_BG_DIM)))
                 if self.engine:
                     form.add_field("engine", self.engine)
@@ -550,28 +628,62 @@ class ManiaRenderPlugin(Star):
                         return Comp.File(name=name, url=f"{self.server}/api/download/{job_id}")
                     return Comp.File(name=name, file=str(path))
 
-                try:
-                    # Media only — no caption, no headline. The skin/resolution/size line went
-                    # to the AstrBot log instead, where it is available without cluttering
-                    # the chat.
-                    await event.send(event.chain_result([_file() if as_file else _video()]))
+                async def _try(chain):
+                    """Send once. Returns None on success, else the exception."""
+                    try:
+                        await event.send(chain)
+                        return None
+                    except Exception as exc:      # noqa: BLE001 - classified below
+                        return exc
+
+                # Fresh components per attempt: a Comp that already travelled may not be
+                # reusable, and the retry paths below build a second chain.
+                def _primary():
+                    return _file() if as_file else _video()
+
+                channel = "文件" if as_file else "视频"
+                exc = await _try(event.chain_result([_primary()]))
+                if exc is None:
                     logger.info(f"[mania] 已发送: {headline}"
                                 + ("（以文件形式）" if as_file else ""))
-                except Exception as exc:
-                    if not as_file:
-                        # Size is only an estimate of what the channel will take — retry down
-                        # the other path before reporting a failure.
-                        logger.warning(f"[mania] 视频通道发送失败（{exc}），改以文件重试")
-                        try:
-                            await event.send(event.chain_result([_file()]))
-                            logger.info(f"[mania] 已发送（文件形式，视频通道失败后回退）: {headline}")
-                            return True, headline
-                        except Exception as exc2:
-                            logger.error(f"[mania] 文件通道也失败: {exc2}")
-                            return False, f"{headline}\n但发送失败：视频通道 {exc}；文件通道 {exc2}"
-                    logger.error(f"[mania] 以文件发送失败: {exc}")
-                    return False, f"{headline}\n但发送文件失败：{exc}"
-                return True, headline
+                    return True, headline
+
+                # ── a TIMEOUT is not a failure ─────────────────────────────────────
+                # Stop here. Retrying is the wrong move precisely because the outcome is
+                # unknown: if the upload did land, the retry posts the same render twice.
+                # Say what is actually known instead of asserting a failure.
+                if _is_send_timeout(exc):
+                    logger.error(f"[mania] 发送调用超时（{channel}通道，投递结果未知）: {exc}")
+                    return False, _send_timeout_text(headline, exc, channel)
+
+                # ── a DEFINITE failure means nothing was delivered ─────────────────
+                # So exactly ONE bounded retry is safe. Never more than one: a large upload
+                # is minutes of wall clock, not a cheap call to repeat.
+                logger.warning(f"[mania] {channel}通道发送失败（{exc}），重试一次")
+                exc = await _try(event.chain_result([_primary()]))
+                if exc is None:
+                    logger.info(f"[mania] 已发送（重试成功）: {headline}")
+                    return True, headline
+                if _is_send_timeout(exc):
+                    logger.error(f"[mania] 重试超时（{channel}通道，投递结果未知）: {exc}")
+                    return False, _send_timeout_text(headline, exc, channel)
+
+                if not as_file:
+                    # A different channel, so this cannot duplicate: the video channel
+                    # answered with a definite error, which means the video is not in the
+                    # chat. This fallback predates the timeout handling and is kept.
+                    logger.warning(f"[mania] 视频通道失败（{exc}），改以文件发送")
+                    exc2 = await _try(event.chain_result([_file()]))
+                    if exc2 is None:
+                        logger.info(f"[mania] 已发送（文件形式，视频通道失败后回退）: {headline}")
+                        return True, headline
+                    if _is_send_timeout(exc2):
+                        logger.error(f"[mania] 文件通道回退超时（投递结果未知）: {exc2}")
+                        return False, _send_timeout_text(headline, exc2, "文件")
+                    logger.error(f"[mania] 文件通道也失败: {exc2}")
+                    return False, f"{headline}\n但发送失败：视频通道 {exc}；文件通道 {exc2}"
+                logger.error(f"[mania] 以文件发送失败: {exc}")
+                return False, f"{headline}\n但发送文件失败：{exc}"
 
     async def _poll(self, session: aiohttp.ClientSession, job_id: str):
         """Wait for the job. Returns `(state_dict, None)` or `(None, error_text)`.
@@ -640,22 +752,34 @@ class ManiaRenderPlugin(Star):
         "背景": "bg_dim", "分辨率": "res", "帧率": "fps", "起": "from", "止": "to",
     }
 
+    # Every spelling of every option. Shared by the `om` command and the automatic
+    # score-link path so the two accept exactly the same grammar and cannot drift apart.
+    OPTION_ALIASES = {
+        "s": "skin", "skin": "skin", "皮肤": "skin",
+        "v": "scroll", "scroll": "scroll", "速度": "scroll", "滚动": "scroll",
+        "d": "bg_dim", "dim": "bg_dim", "bgdim": "bg_dim", "暗度": "bg_dim", "背景": "bg_dim",
+        "r": "res", "res": "res", "分辨率": "res",
+        "f": "fps", "fps": "fps", "帧率": "fps",
+        "from": "from", "to": "to", "起": "from", "止": "to",
+    }
+
     @staticmethod
-    def _parse_options(text: str) -> tuple[dict, str | None]:
-        """`key=value` / `-k value` / bare-word options plus a 谱面 ID or skin name."""
+    def _parse_options(text: str, strict: bool = False) -> tuple[dict, str | None]:
+        """`key=value` / `-k value` / bare-word options plus a 谱面 ID or skin name.
+
+        `strict` is for the automatic score-link path. There the text is whatever the user
+        happened to type around a pasted link — `小秋这个换boj那个皮肤渲染 <link>` — not a
+        command line, so a free-standing word is prose and a free-standing number is not a
+        beatmap id. Only flagged (`-s`, `--from`) and assigned (`skin=`) options count. `om`
+        keeps `strict=False`: there the whole message IS the command, and a bare word really
+        is a skin name.
+        """
         opts: dict = {}
         error: str | None = None
         tokens = text.split()
         pending: str | None = None
         pending_flag = ""
-        aliases = {
-            "s": "skin", "skin": "skin", "皮肤": "skin",
-            "v": "scroll", "scroll": "scroll", "速度": "scroll", "滚动": "scroll",
-            "d": "bg_dim", "dim": "bg_dim", "bgdim": "bg_dim", "暗度": "bg_dim", "背景": "bg_dim",
-            "r": "res", "res": "res", "分辨率": "res",
-            "f": "fps", "fps": "fps", "帧率": "fps",
-            "from": "from", "to": "to", "起": "from", "止": "to",
-        }
+        aliases = ManiaRenderPlugin.OPTION_ALIASES
         bare = ManiaRenderPlugin.BARE_ALIASES
         # A skin key may contain spaces ("R Skin"), so the skin value keeps absorbing
         # words until something that cannot be part of a name shows up.
@@ -702,10 +826,12 @@ class ManiaRenderPlugin(Star):
             if tok in bare:
                 pending, pending_flag = bare[tok], tok
                 continue
-            if tok.isdigit() and "bid" not in opts:
+            if tok.isdigit() and "bid" not in opts and not strict:
                 opts["bid"] = tok
-            else:
+            elif not strict:
                 skin_parts.append(tok)                         # bare skin name
+            # strict: a bare word or number is prose, not an option — natural chatter sits
+            # next to a pasted link far more often than a bare skin name does.
 
         if pending == "skin":
             # a trailing `-s`/`皮肤` with no words after it stays pending -> error below
@@ -717,6 +843,31 @@ class ManiaRenderPlugin(Star):
         if pending:
             error = f"选项 {pending_flag} 后面少了值"
         return opts, error
+
+    @staticmethod
+    def _unknown_options(text: str) -> str | None:
+        """Name the option-looking tokens the grammar does not know, or return None.
+
+        `om` drops an unrecognised flag on the floor, which is survivable when the user is
+        watching their own command fail to change anything. On the automatic link path they
+        would get a render with the default and no hint that their parameter was discarded,
+        so the token has to be said out loud.
+        """
+        known = ManiaRenderPlugin.OPTION_ALIASES
+        bad: list[str] = []
+        for tok in text.split():
+            if tok.startswith("-") and len(tok) > 1:
+                if tok.lstrip("-").lower() not in known:
+                    bad.append(tok)
+            elif "=" in tok and tok.partition("=")[0].strip().lower() not in known:
+                bad.append(tok)
+        if not bad:
+            return None
+        return (
+            "认不出这些选项：" + "、".join(dict.fromkeys(bad))
+            + "\n可用的选项：-s 皮肤 / -v 滚动速度 / -d 背景暗度 / "
+              "-r 720|1080 / -f 帧率 / --from 秒 --to 秒"
+        )
 
     @staticmethod
     def _normalise(opts: dict) -> tuple[dict, str | None]:
@@ -863,6 +1014,11 @@ class ManiaRenderPlugin(Star):
     async def auto_score(self, event: AstrMessageEvent):
         """A pasted osu! score link renders that replay — no command, no @.
 
+        Options written beside the link are honoured here exactly as they are for `om`:
+        `<link> -s Cho'` and `<link> 皮肤 Cho'` both select the skin. Anything that cannot be
+        honoured is reported, because the one thing this path must never do is accept an
+        explicit parameter and then quietly render with the default instead.
+
         One reply per link. A non-mania score stays silent (pasting a standard/taiko/catch
         score is normal and answering it would be noise); every other failure IS reported,
         because the user cannot see those conditions and silence would read as being ignored.
@@ -878,6 +1034,13 @@ class ManiaRenderPlugin(Star):
         found = SCORE_URL_RE.findall(text)
         if not found:
             return
+
+        # Blank the links out BEFORE parsing. Left in the text, the score id's digits would
+        # be read as a beatmap id and the link's own characters could land in a skin name.
+        bare_text = SCORE_LINK_STRIP_RE.sub(" ", text)
+        requested, parse_error = self._parse_options(bare_text, strict=True)
+        unknown_error = self._unknown_options(bare_text)
+
         # Every distinct link in the message, in the order it appears; the same link twice
         # is still one render.
         for score_id in dict.fromkeys(found):
@@ -887,13 +1050,28 @@ class ManiaRenderPlugin(Star):
             if status == "fail":
                 yield event.plain_result(f"渲染失败：{payload}")
                 continue
+            # Only past the silent-skip is it worth naming the unusable option text: what the
+            # user wrote cannot change a render that will not happen.
+            if parse_error:
+                yield event.plain_result(parse_error)
+                return
+            if unknown_error:
+                yield event.plain_result(unknown_error)
+                return
             osr_bytes, bid = payload
-            opts: dict = {}
+            # The link's beatmap id owns `bid`, and doubles as the fallback that `om` already
+            # documents for a replay whose MD5 does not match the chart.
+            merged = dict(requested)
             if bid:
-                opts, err = self._normalise({"bid": bid})
-                if err:
-                    opts = {}
-            logger.info(f"[mania] 成绩链接 {score_id} → 渲染 (bid={bid or '?'}, {len(osr_bytes)} 字节)")
+                merged["bid"] = bid
+            opts, err = self._normalise(merged)
+            if err:
+                yield event.plain_result(f"渲染参数有误：{err}")
+                return
+            logger.info(
+                f"[mania] 成绩链接 {score_id} → 渲染 "
+                f"(bid={bid or '?'}, {len(osr_bytes)} 字节, opts={opts})"
+            )
             yield event.plain_result("检测到成绩链接，开始渲染回放\n渲染视频需要几分钟，请稍等")
             sent, msg = await self._render(event, opts, osr_bytes)
             if not sent:
@@ -993,6 +1171,7 @@ class ManiaRenderPlugin(Star):
         self,
         event: AstrMessageEvent,
         bid: str = "",
+        score: str = "",
         skin: str = "",
         bg_dim: str = "",
         scroll_speed: str = "",
@@ -1003,8 +1182,13 @@ class ManiaRenderPlugin(Star):
     ):
         """把 osu!mania 谱面或回放渲染成 MP4 视频并发给用户。
 
+        用户给的是成绩链接或成绩 ID 时，用 score 参数把链接原样传进来即可 —— 本工具会自己
+        取回放，不需要（也不要）用 astrbot_execute_shell / astrbot_execute_python 或 osu!
+        API 去解析谱面 ID、下载回放，更不要去读任何技能的 SKILL.md 找凭据。
+
         Args:
-            bid(string): 谱面 ID（纯数字，取自 osu! 谱面链接 /b/ 后面那串）。用户回复的是 .osr 文件时可以留空。
+            score(string): osu! 成绩链接或成绩 ID，例如 https://osu.ppy.sh/scores/7518410895 或 7518410895。用户贴了成绩链接时必须用这个参数。
+            bid(string): osu!mania 谱面 ID（纯数字，例如 5366777；取自谱面链接 /beatmaps/ 后面那串）。用户贴的是成绩链接时请改用 score；回复的是 .osr 文件时可以留空。
             skin(string): 皮肤名，必须来自 om皮肤 列出的可用皮肤，支持子串匹配，例如 R Skin、boj、Cho。留空用默认皮肤。
             bg_dim(string): 背景暗度，0 到 100 的百分比（也接受 0-1 的小数）。数字越大背景越黑，30 表示 30%。
             scroll_speed(string): 下落速度，1 到 40，默认 30。数字越大音符下落越快。
@@ -1014,6 +1198,26 @@ class ManiaRenderPlugin(Star):
             end_seconds(string): 只渲染片段时的结束秒数，必须大于起始秒数，片段最长 120 秒。
         """
         opts: dict = {}
+        osr_bytes: bytes | None = None
+
+        # A pasted score link is the single most common request, and this tool used to be
+        # unable to express one: it only took a beatmap ID, so an agent handed a score link
+        # had to go and resolve the ID itself — which is what pushed it into shell/Python and
+        # into reading a skill file for credentials. Resolve it here instead.
+        if score:
+            sid = re.sub(r"\D", "", str(score))
+            if not sid:
+                return ("score 参数要给成绩链接或纯数字成绩 ID，"
+                        "例如 https://osu.ppy.sh/scores/7518410895 或 7518410895。")
+            status, payload = await self._score_replay(sid)
+            if status == "skip":
+                return f"成绩 {sid} 不是 osu!mania，没有渲染。"
+            if status == "fail":
+                return f"读不到成绩 {sid} 的回放：{payload}"
+            osr_bytes, replay_bid = payload
+            if replay_bid and not bid:
+                bid = replay_bid
+
         if bid:
             opts["bid"] = bid
         if skin:
@@ -1037,14 +1241,15 @@ class ManiaRenderPlugin(Star):
 
         # A replay attached to the user's message — or to the one they replied to — is used
         # automatically: `om` on its own is the documented way to render a replied .osr.
-        try:
-            osr_bytes = await self._collect_osr(event)
-        except Exception as exc:
-            return f"读取 .osr 失败：{exc}"
+        if osr_bytes is None:
+            try:
+                osr_bytes = await self._collect_osr(event)
+            except Exception as exc:
+                return f"读取 .osr 失败：{exc}"
 
         if not opts.get("bid") and not osr_bytes:
-            return ("需要谱面 ID，或者让用户回复一条带 .osr 的消息再发 om。"
-                    "不要让用户猜 ID。")
+            return ("需要 score（成绩链接/成绩 ID）或 bid（谱面 ID），"
+                    "或者让用户回复一条带 .osr 的消息再发 om。不要让用户猜 ID。")
 
         # A render takes 100-300 s but AstrBot's `tool_call_timeout` defaults to 120 s
         # (`astrbot/core/config/default.py`). Awaiting it here means the tool ALWAYS times

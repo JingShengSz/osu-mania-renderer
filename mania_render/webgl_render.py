@@ -12,13 +12,21 @@ How it works
    hands the result to the download machinery.
 4. `Browser.setDownloadBehavior` points that download at a directory we watch.
 
-Two consequences of MediaRecorder are worth stating plainly, because they cannot be
+Two consequences of the export path are worth stating plainly, because they cannot be
 engineered away:
 
-* **the recording is real time** — a 150 s chart takes 150 s of wall clock, and a
-  machine that cannot draw 60 fps will drop frames rather than slow down;
-* **the canvas is fixed at 1920x1080**, so any other requested size is an ffmpeg
-  scale afterwards, and a requested time range is an ffmpeg trim.
+* **the whole chart is encoded** — the page always exports from 0 to the end of the chart,
+  so a `range` is an ffmpeg trim applied to a full-length encode, not a shorter recording;
+* **the size is passed through, never rescaled here** — `window.__webglOutW`/`__webglOutH`
+  make the page encode at exactly the requested size (a GPU blit from its 1920x1080
+  canvases), so the mux below never has to scale. A request that carries no size at all is
+  resolved by the caller (`webapp.DEFAULT_WIDTH`/`DEFAULT_HEIGHT`), not guessed here; when
+  it arrives as 0x0 the page's own canvas size is what gets encoded.
+* **the bitrate is set here too** — `window.__webglBitrate` is the page's encoding rate, and
+  it is the only thing that decides the finished file's size. It is set from the caller's
+  `bitrate_kbps` (resolved by `webapp`), never left to the page's own default, because that
+  default is tuned for a human's local export rather than for a file that has to be
+  uploaded to a chat platform.
 """
 from __future__ import annotations
 
@@ -91,6 +99,7 @@ def render(job_id: str, bid: str, skin_key: str, *, osr_path: Path | None,
            scroll: float, bg_dim: float, range_s: str | None,
            width: int, height: int, work_dir: Path, out_path: Path,
            ffmpeg: str, progress: ProgressFn, audio_path: Path | None = None,
+           bitrate_kbps: int = 0,
            chrome_host: str = "127.0.0.1", chrome_port: int = 9222,
            timeout: float = 1800.0) -> Path:
     """Render via the page and return the finished file path."""
@@ -212,6 +221,15 @@ def render(job_id: str, bid: str, skin_key: str, *, osr_path: Path | None,
         if width and height:
             cdp.evaluate(f"window.__webglOutW = {int(width)}; window.__webglOutH = {int(height)}",
                          session=sid)
+        # The bitrate rides the same door. It is what decides the delivered file's size,
+        # and the size is what decides whether the upload channel carries it at all — the
+        # page's own default (6 Mbps) is for a human exporting a local file, and produced
+        # 74.8 MB for an 86 s chart here, which the adapter's channel timed out on. The
+        # service resolves the rate (request `bitrate_kbps`, else MANIA_BITRATE, else
+        # DEFAULT_BITRATE_KBPS); 0 means "leave the page alone", which is only reachable if
+        # a caller passes nothing.
+        if bitrate_kbps and int(bitrate_kbps) > 0:
+            cdp.evaluate(f"window.__webglBitrate = {int(bitrate_kbps) * 1000}", session=sid)
         cdp.evaluate(f"window.__webglJobId = {job_id!r}", session=sid)
         cdp.evaluate("document.getElementById('btnExport').click()", session=sid)
 

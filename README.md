@@ -136,7 +136,58 @@ python -m mania_render --id 2467450 --osu-file map.osu --audio song.mp3 --dry-ru
 | `MANIA_DEFAULT_SKIN` | UI 里预选的皮肤 | `boj 1-10K` |
 | `MANIA_HOST` | `--web` 绑定地址 | `127.0.0.1` |
 | `MANIA_PORT` | `--web` 端口 | `8760` |
+| `MANIA_ENGINE` | 任务没带 `engine` 字段时用哪个渲染引擎：`webgl` 或 `python` | `webgl` |
+| `MANIA_CHROME_HOST` / `MANIA_CHROME_PORT` | WebGL 引擎要连的 Chrome（CDP） | `127.0.0.1` / `9222` |
+| `MANIA_WIDTH` / `MANIA_HEIGHT` | 任务没带 `width`/`height` 时的输出尺寸 | `1920` / `1080` |
+| `MANIA_BITRATE` | 任务没带 `bitrate_kbps` 时的视频码率（kbps） | `2000` |
 | `OSU_USER_TOKEN` | osu! 用户级 token，用于官方 `.osz` 下载 | 读 `cache/osu_token.json` |
+
+### 两个渲染引擎
+
+`POST /api/render` 可以带 `engine=webgl`（默认）或 `engine=python`：
+
+- **webgl** —— 用 CDP 驱动 `/` 那个页面（就是浏览器里看到的那一套渲染），编码在页面里用
+  WebCodecs 完成，帧数据流回服务端，再由 ffmpeg 封装成 MP4 并混入音频。因此它需要一台跑着
+  的 Chrome（`127.0.0.1:9222`，GPU 必须是 D3D11/ANGLE；SwiftShader 实测慢约 7 倍）。
+  本机部署里这个 Chrome 由 `tools/render-node/render-node.ps1` 负责拉起与守护，
+  详见 `tools/render-node/README.md`。
+- **python** —— Pillow 渲染器，不需要浏览器，作为备选保留。
+
+两者画出来的画面**不一样**，耗时也不同，所以这是用户可见的开关，不是内部细节。
+
+输出尺寸按任务请求走：`width`/`height` 会原样传给页面（页面按该尺寸编码，不是先编码再缩放），
+没带这两个字段时才用上面的 `MANIA_WIDTH`/`MANIA_HEIGHT`。历史上这两个默认值是 1280x720，
+于是"没写尺寸"在 WebGL 上得到 720p、在 Python 上仍是 1080p —— 同一个请求随引擎变尺寸，已改正为 1920x1080。
+
+> WebGL 引擎会把**整首**谱面编码一遍，`range` 只是编码后的 ffmpeg 裁剪，所以它不会因为
+> `range=0-10` 就变快；`python` 引擎则只渲染区间内的帧。
+
+### 码率（`bitrate_kbps`）
+
+码率决定成片体积，而体积决定这条视频**能不能发出去**：成片要经协议端上传，通道对体积有上限，
+超了就是发送超时。所以这个默认值不是画质偏好，是投递约束。
+
+- 请求字段 `bitrate_kbps`（kbps），服务端默认 `DEFAULT_BITRATE_KBPS`（`MANIA_BITRATE`，2000）。
+  和 `width`/`height` 一个路子：请求里有就用请求的，没有才用服务端默认。
+- 服务端把它换算成 bps 写进页面的 `window.__webglBitrate`，页面不再自己决定这个数。
+  页面自身的默认（`MANUAL_BITRATE`，6 Mbps）只服务**手动导出**：人在浏览器里点「导出」拿到的是
+  本地文件，不经过任何上传通道，所以不降质。
+- 页面侧对 bot 任务还会强制 `bitrateMode: 'constant'`。**这一条是必须的**：WebCodecs 默认的
+  可变码率会把目标码率让给画质，实测同一张图请求 2000 kbps，R Skin 出 2.22 Mbps，boj 出
+  4.78 Mbps（239%，且三次复现到个位）。按 4 分钟图谱外推就是 ~146 MB，正好撞上限。
+- 另有 `BOT_MAX_BYTES`（72 MB，含混流后音轨的预留）作为兜底：超过约 5 分钟的谱面会按体积反推
+  码率，把整片压在这个数以内；手动导出不受此限。
+
+实测（同一张 86.3 s 谱面，webgl 引擎，1920×1080/60fps/aac）：
+
+| 码率 | 皮肤 | 成片 | 视频码率 |
+|---|---|---|---|
+| 6000（旧默认） | boj | 72.8 MiB | 7.02 Mbps |
+| 2000 | boj | 21.9 MiB | 1.97 Mbps |
+| 2000 | R Skin | 16.7 MiB | 1.46 Mbps |
+
+4 分 11 秒谱面：boj 65.3 MiB / R Skin 52.6 MiB，均低于插件的 80 MB 文件阈值。
+
 
 ## 7. AstrBot 插件
 
@@ -176,10 +227,8 @@ om 2467450 --from 60 --to 75
 
 ## 8. 许可
 
-**本仓库当前没有添加 LICENSE**：作者尚未选择许可协议。公开发布但不带许可证，默认即为
-**保留所有权利（all rights reserved）** —— 他人可以阅读，但法律上并不获得复制、修改或
-再分发的授权。若希望别人能合法使用，请由作者自行选择并添加一份许可证
-（MIT / Apache-2.0 / GPL-3.0 等）。
+本项目以 **MIT 许可证**发布，完整条文见仓库根目录的 [`LICENSE`](LICENSE)
+（Copyright (c) 2026 JingShengSz）。
 
 另外，osu! 的名称与相关素材归 ppy Pty Ltd 所有；本项目与 osu! 官方无隶属关系。
 皮肤、谱面与音频的版权归各自作者所有，请自行确保你有权使用。

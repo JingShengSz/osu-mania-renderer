@@ -98,6 +98,37 @@ DEFAULT_ENGINE = os.environ.get("MANIA_ENGINE", "webgl").strip().lower()
 CHROME_HOST = os.environ.get("MANIA_CHROME_HOST", "127.0.0.1")
 CHROME_PORT = int(os.environ.get("MANIA_CHROME_PORT", "9222"))
 
+# What a job renders at when the request carries no `width`/`height`.
+#
+# 1920x1080 is the size the page itself is built at: `mania-web/index.html` declares both
+# canvases as width="1920" height="1080", and the Pillow renderer's geometry is fixed
+# there too. The pair used to be 1280x720, which made "say nothing" mean 720p on the WebGL
+# engine while the Python engine still produced 1080p from the same request — the same job
+# silently changing size with the engine. A caller that wants 720p still gets it by asking
+# (`width=1280&height=720`, which is what the plugin sends for `default_resolution: 720`).
+DEFAULT_WIDTH = int(os.environ.get("MANIA_WIDTH", "1920"))
+DEFAULT_HEIGHT = int(os.environ.get("MANIA_HEIGHT", "1080"))
+
+# What a job encodes at when the request carries no `bitrate_kbps`, in kbps.
+#
+# This is the knob that decides the finished file's size, and therefore whether the file
+# can be delivered at all. Size is not a taste question here: the plugin hands the MP4 to
+# the platform's protocol adapter, which pushes it over an upload channel that times out on
+# a large body. Measured on this pipeline, same 86 s chart, webgl engine:
+#
+#   6000 kbps -> 74.8 MB. The video channel timed out mid-send, the plugin fell back to the
+#                file channel, that timed out too, and the chat got a 「发送失败」 for a
+#                video that had in fact already been delivered. A 4-minute chart at that
+#                rate is ~200 MB, which never arrives at all.
+#   2000 kbps -> ~24 MB (the default below). A 4-minute chart stays near 60 MB, inside the
+#                plugin's 80 MB `video_file_threshold_mb`.
+#
+# `MANIA_BITRATE` overrides it, in kbps, exactly like `MANIA_WIDTH`/`MANIA_HEIGHT`. The
+# page's OWN default (6000 kbps, `MANUAL_BITRATE` in mania-web/src/main.js) is deliberately
+# unchanged: a human clicking 导出 writes a local file that never crosses an upload channel,
+# so the manual export keeps the higher quality.
+DEFAULT_BITRATE_KBPS = int(os.environ.get("MANIA_BITRATE", "2000"))
+
 
 def default_skin_key() -> str:
     if DEFAULT_SKIN_KEY in SKINS:
@@ -326,6 +357,50 @@ loadSkins();
 API_LOG_LOCK = threading.Lock()
 
 
+class StreamGap(Exception):
+    """The client asked to append past what is on disk: bytes it sent never arrived."""
+
+
+def _append_stream(path: Path, offset: int, body: bytes) -> int:
+    """Append one upload to the H.264 stream and return the new length.
+
+    The page sends each ~1.5 MB batch as its own POST, ~50 of them for a 95 s chart and
+    several hundred for a long one. Measured: one such POST in ~250 was lost mid-flight and
+    the page's fetch rejected with `TypeError: Failed to fetch`, which killed the whole
+    render at 49% (`导出失败: Failed to fetch`, 40 MB already uploaded). A blind retry is not
+    a fix -- re-sending a batch whose *reply* was lost would append its bytes twice and
+    splice a duplicate into the Annex-B stream, which muxes into a file that looks fine and
+    plays broken. So every request carries the byte position it is writing at, and this is
+    what makes the retry safe:
+
+      * offset beyond what is stored -> bytes are missing. REFUSE: appending would leave a
+        hole, and the page's retry at the same offset is the thing that can still fix it.
+      * the batch is already stored in full -> a repeat after a lost reply. Write nothing.
+      * part of the batch is stored -> a broken connection cut the previous attempt short.
+        Everything past `offset` is that same batch's tail (the page only ever appends at
+        the offset it last had confirmed), so drop it and rewrite the batch.
+      * offset == stored length -> the ordinary case: append.
+      * offset < 0 -> a client that sends no offset. Append, as this endpoint always did.
+    """
+    size = path.stat().st_size if path.is_file() else 0
+    if offset < 0:
+        if body:
+            with open(path, "ab") as fh:
+                fh.write(body)
+        return path.stat().st_size if path.is_file() else 0
+    if offset > size:
+        raise StreamGap(f"offset={offset} but only {size} bytes are stored")
+    if offset + len(body) <= size:
+        return size
+    if offset < size:
+        with open(path, "r+b") as fh:
+            fh.truncate(offset)
+    if body:
+        with open(path, "ab") as fh:
+            fh.write(body)
+    return path.stat().st_size if path.is_file() else 0
+
+
 def _api_log(line: str) -> None:
     """Append one line to cache/api.log.
 
@@ -439,7 +514,8 @@ def _multipart_fields(body: bytes, ctype: str) -> tuple[dict, dict]:
 
 def _run_job_webgl(job_id: str, bid: str, skin_key: str, scroll: float, fps: int,
                    range_s: str | None, lead_in: float | None, osr_path: Path | None,
-                   bg_dim: float = 0.6, width: int = 0, height: int = 0) -> None:
+                   bg_dim: float = 0.6, width: int = 0, height: int = 0,
+                   bitrate_kbps: int = 0) -> None:
     """Render by driving the WebGL page in headless Chromium.
 
     Same job contract as `_run_job`: progress goes into JOBS and the finished file
@@ -473,14 +549,17 @@ def _run_job_webgl(job_id: str, bid: str, skin_key: str, scroll: float, fps: int
             limit = float(JOBS[job_id].get("timeout") or 3600)
         webgl_render(
             job_id, bid, skin_key, osr_path=osr_path, scroll=scroll, bg_dim=bg_dim,
-            range_s=range_s, width=width, height=height,
+            range_s=range_s, width=width, height=height, bitrate_kbps=bitrate_kbps,
             work_dir=CACHE / "webgl_work", out_path=out, ffmpeg=_find_ffmpeg(),
             progress=lambda pct, msg: set_("running", message=msg, percent=pct),
             chrome_host=CHROME_HOST, chrome_port=CHROME_PORT, timeout=limit,
             audio_path=audio_path,
         )
+        # The bitrate is echoed into the job record so a caller can prove which rate a file
+        # was actually encoded at without reading the page's console.
         set_("done", message="完成", output=str(out), percent=100,
-             width=width or 1920, height=height or 1080)
+             width=width or 1920, height=height or 1080,
+             bitrate_kbps=bitrate_kbps, size_bytes=out.stat().st_size)
     except WebGLRenderError as exc:
         set_("error", error=str(exc), message="失败")
     except Exception as exc:
@@ -490,6 +569,14 @@ def _run_job_webgl(job_id: str, bid: str, skin_key: str, scroll: float, fps: int
 
 def _dispatch_job(engine: str, *args) -> None:
     """Route a job to the requested renderer."""
+    # Name the engine in BOTH traces. The two engines produce different pictures, so
+    # "which one actually ran" is not a detail: without this line a job that fell through
+    # to the other renderer looks exactly like a job that ran the one that was asked for.
+    # stdout is block-buffered when the service has no tty (the supervisor redirects it to
+    # a file), hence flush, and api.log is a second, always-flushed trace.
+    job_id = args[0] if args else "?"
+    print(f"[engine] job={job_id} engine={engine}", flush=True)
+    _api_log(f"engine job={job_id} engine={engine}")
     if engine == "python":
         _run_job(*args)
     else:
@@ -497,7 +584,13 @@ def _dispatch_job(engine: str, *args) -> None:
 
 
 def _run_job(job_id: str, bid: str, skin_key: str, scroll: float, fps: int,             range_s: str | None, lead_in: float | None, osr_path: Path | None,
-             bg_dim: float = 0.6, width: int = 0, height: int = 0) -> None:
+             bg_dim: float = 0.6, width: int = 0, height: int = 0,
+             bitrate_kbps: int = 0) -> None:
+    # `bitrate_kbps` is accepted for signature parity with `_run_job_webgl` — both are
+    # called through `_dispatch_job(*args)`. It is unused here on purpose: the Pillow
+    # renderer encodes with a fixed CRF, not a target bitrate, and it must keep working as
+    # the selectable fallback engine.
+    del bitrate_kbps
     # Render-stack imports live here so the static/API server never loads Pillow or numpy.
     from .cli import _pick_skin
     from .playfield import build_geometry
@@ -851,24 +944,51 @@ class Handler(BaseHTTPRequestHandler):
         if u.path.startswith("/api/webgl-stream/"):
             # The page's WebCodecs export streams Annex-B H.264 here as it is encoded,
             # instead of holding ~200 MB in the tab and handing over one blob at the end.
-            # Appending is safe because the page serialises its own requests.
+            # Appending is safe because the page serialises its own requests -- and because
+            # each request now carries the byte offset it is writing at (see _append_stream).
             job_id = u.path.rsplit("/", 1)[-1]
             if not re.fullmatch(r"[0-9a-zA-Z_-]{1,64}", job_id):
                 return _json(self, 400, {"error": "bad job id"})
             n = int(self.headers.get("Content-Length") or 0)
-            body = self.rfile.read(n) if n else b""
-            done = parse_qs(u.query).get("done", ["0"])[0] == "1"
+            qs = parse_qs(u.query)
+            done = qs.get("done", ["0"])[0] == "1"
+            try:
+                offset = int(qs.get("offset", ["-1"])[0])
+            except ValueError:
+                offset = -1
+            # Traced on arrival AND on completion. The page's side of a failure here is the
+            # browser's opaque `TypeError: Failed to fetch`, which says nothing about
+            # whether the request reached the server, how much of the body arrived, or how
+            # far the file got -- and those are the only three things that tell a client
+            # failure apart from a server one.
+            _api_log(f"stream -> job={job_id} len={n} offset={offset} done={int(done)}")
+            try:
+                body = self.rfile.read(n) if n else b""
+            except OSError as exc:
+                # Whatever did arrive is still on disk; the page's retry at the same offset
+                # truncates it and rewrites the batch.
+                _api_log(f"stream read-failed job={job_id} err={exc!r}")
+                body = b""
             out = CACHE / "renders" / f"{job_id}.h264"
             out.parent.mkdir(parents=True, exist_ok=True)
-            if body:
-                with open(out, "ab") as fh:
-                    fh.write(body)
+            try:
+                total = _append_stream(out, offset, body)
+            except StreamGap as exc:
+                _api_log(f"stream 409 job={job_id} {exc}")
+                return _json(self, 409, {"error": f"offset gap: {exc}"})
+            except OSError as exc:
+                # An unhandled OSError here closes the socket with no status line, which the
+                # page reports as the opaque `Failed to fetch`.
+                _api_log(f"stream 500 job={job_id} got={len(body)}/{n} offset={offset} err={exc!r}")
+                return _json(self, 500, {"error": f"写流失败: {exc}"})
+            _api_log(f"stream ok  job={job_id} got={len(body)}/{n} offset={offset} "
+                     f"total={total} done={int(done)}")
             if done:
                 with JOBS_LOCK:
                     job = JOBS.setdefault(job_id, {"id": job_id})
                     job["stream_done"] = True
                     job["stream_path"] = str(out)
-            return _json(self, 200, {"received": len(body), "done": done})
+            return _json(self, 200, {"received": len(body), "offset": total, "done": done})
         if u.path == "/api/skin_scroll":
             n = int(self.headers.get("Content-Length") or 0)
             body = json.loads(self.rfile.read(n) or b"{}")
@@ -935,10 +1055,13 @@ class Handler(BaseHTTPRequestHandler):
             bid = (fields.get("bid") or "").strip()
             skin_key = fields.get("skin") or default_skin_key() or next(iter(SKINS))
             scroll = float(fields.get("scroll") or DEFAULT_SCROLL)
-            # 60 fps / 720p are the defaults the bot ships with.
+            # 60 fps is the default the page encodes at (WC_FPS in mania-web/src/main.js).
             fps = int(fields.get("fps") or 60)
-            width = int(fields.get("width") or 1280)
-            height = int(fields.get("height") or 720)
+            width = int(fields.get("width") or DEFAULT_WIDTH)
+            height = int(fields.get("height") or DEFAULT_HEIGHT)
+            # Video bitrate in kbps. Like width/height: a request field, a server-side
+            # default (MANIA_BITRATE), and the page told explicitly what to encode at.
+            bitrate_kbps = int(fields.get("bitrate_kbps") or DEFAULT_BITRATE_KBPS)
             dim = fields.get("bg_dim")
             bg_dim = float(dim) if dim not in (None, "") else 0.6
             bg_dim = min(1.0, max(0.0, bg_dim))
@@ -974,12 +1097,13 @@ class Handler(BaseHTTPRequestHandler):
                     "id": job_id, "state": "queued", "message": "排队中", "percent": 0,
                     "bid": bid, "skin": skin_key, "scroll": scroll, "fps": fps,
                     "width": width, "height": height, "bg_dim": bg_dim,
+                    "bitrate_kbps": bitrate_kbps,
                     "range": range_s, "replay": bool(osr_path), "engine": engine,
                 }
             threading.Thread(
                 target=_dispatch_job, daemon=True,
                 args=(engine, job_id, bid, skin_key, scroll, fps, range_s, lead_in, osr_path,
-                      bg_dim, width, height),
+                      bg_dim, width, height, bitrate_kbps),
             ).start()
             return _json(self, 200, {"id": job_id, "job": JOBS[job_id]})
         _json(self, 404, {"error": "not found"})
